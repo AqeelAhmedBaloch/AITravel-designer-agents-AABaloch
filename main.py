@@ -1,117 +1,111 @@
-import os
-import re
-import chainlit as cl
-from dotenv import load_dotenv
-from agents import Agent, Runner, AsyncOpenAI, OpenAIChatCompletionsModel
-from agents.run import RunConfig
 
-# Load environment variables
+import os
+import chainlit as cl
+from typing import cast
+from dotenv import load_dotenv
+from openai import OpenAI
+from agents import Agent, Runner, RunConfig, handoff, AsyncOpenAI, OpenAIChatCompletionsModel, Tool
+
 load_dotenv()
 
-# Initialize Gemini-compatible OpenAI client
-client = AsyncOpenAI(
-    api_key=os.getenv("GEMINI_API_KEY"),
-    base_url=os.getenv("BASE_URL")
-)
-
-# Model setup
-model = OpenAIChatCompletionsModel(
-    model="gemini-2.0-flash",
-    openai_client=client
-)
-
-# Runner configuration
-config = RunConfig(
-    model=model,
-    tracing_disabled=True
-)
 
 # ---------------------------
-# Utility: Convert USD to PKR
+#  Configuration Setup
 # ---------------------------
-def convert_usd_to_pkr(text, rate=280):
-    """
-    Finds $ amounts and converts to PKR using a fixed exchange rate.
-    Example: $100 → $100 (PKR 28000)
-    """
-    def replacer(match):
-        usd = float(match.group(1))
-        pkr = int(usd * rate)
-        return f"${usd:.0f} ({pkr} PKR)"
-    
-    return re.sub(r"\$(\d+(?:\.\d{1,2})?)", replacer, text)
+def setup_config():
+    # External Gemini client
+    external_client = AsyncOpenAI(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        base_url=os.getenv("BASE_URL"),
+    )
+
+    model = OpenAIChatCompletionsModel(
+        model="gemini-2.0-flash",
+        openai_client=external_client,
+    )
+
+    config = RunConfig(
+        model=model,
+        model_provider=external_client,
+        tracing_disabled=True
+    )
+
+    # ---------------------------
+    #  Agents
+    # ---------------------------
+    destination_agent = Agent(
+        name="destination_agent",
+        instructions="You help users find destinations based on preferences.",
+        handoff_description="Destination finder agent",
+        model=model,
+    )
+
+    booking_agent = Agent(
+        name="booking_agent",
+        instructions="You handle travel bookings (flights, hotels, cars).",
+        handoff_description="Booking manager agent",
+        model=model,
+
+    )
+
+    explore_agent = Agent(
+        name="explore_agent",
+        instructions="You suggest attractions, food, and experiences in a location.",
+        handoff_description="Attraction and food suggestion agent",
+        model=model
+    )
+
+    triage_agent = Agent(
+        name="triage_agent",
+        instructions=(
+            "You triage travel-related queries to the right agent. "
+            "If multiple agents are needed, call them in the right order. "
+            "Always use provided tools for flights/hotels, never fetch them yourself."
+        ),
+        handoffs=[
+            handoff(destination_agent),
+            handoff(booking_agent),
+            handoff(explore_agent)
+        ],
+        model=model
+    )
+
+    return triage_agent, config
+
 
 # ---------------------------
-# Agent Definitions
+#  Chainlit Events
 # ---------------------------
-
-# Step 1: Destination Suggestion Agent
-destination_agent = Agent(
-    name="DestinationAgent",
-    instructions="You are a travel assistant. Suggest 1-2 exciting travel destinations based on the user's mood or interest in a friendly and concise way.",
-    model=model,
-)
-
-# Step 2: Booking Simulation Agent
-booking_agent = Agent(
-    name="BookingAgent",
-    instructions="""
-You are a booking assistant. Simulate flight and hotel bookings based on the destination.
-DO NOT use actual function names like get_flights() or suggest_hotels(). Just describe:
-
-- Two flights (airline, time, price)
-- Two hotels (name, location, rating)
-
-Respond in short, friendly bullet points.
-""",
-    model=model,
-)
-
-# Step 3: Explore Attractions Agent
-explore_agent = Agent(
-    name="ExploreAgent",
-    instructions="Suggest 2 popular attractions and 2 local food items to try at the destination. Keep it short and exciting.",
-    model=model,
-)
-
-# ---------------------------
-# Chainlit Chat Logic
-# ---------------------------
-
 @cl.on_chat_start
-async def welcome_message():
-    await cl.Message(
-        content="#### AI Travel Designer Agent by *Aqeel Ahmed Baloch*\n\nWelcome! I’ll help plan your next adventure by coordinating between expert agents.\nJust tell me your **mood** or **interest** (e.g., `relaxing`, `adventure`, `cultural travel`) to get started!"
-    ).send()
+async def start():
+    triage_agent, config = setup_config()
+
+    cl.user_session.set("triage_agent", triage_agent)
+    cl.user_session.set("config", config)
+    cl.user_session.set("chat_history", [])
+
+    await cl.Message(content="🌍 Welcome to AI Travel Designer Agent!(Aqeel Ahmed Baloch)").send()
+
 
 @cl.on_message
-async def handle_user_input(message: cl.Message):
-    mood_or_interest = message.content.strip()
+async def main(message: cl.Message):
+    msg = cl.Message(content="✈️ Thinking...")
+    await msg.send()
 
-    await cl.Message(content=f"✈️ Received: **{mood_or_interest}**\nPlanning your trip...").send()
+    triage_agent = cast(Agent, cl.user_session.get("triage_agent"))
+    config = cast(RunConfig, cl.user_session.get("config"))
+    history = cl.user_session.get("chat_history") or []
 
-    # Step 1: Destination suggestion
-    await cl.Message(content="🔍 Finding ideal destinations...").send()
-    result1 = await Runner.run(destination_agent, input=mood_or_interest, run_config=config)
-    destination = result1.final_output.strip()
-    await cl.Message(content=f"📍 **Suggested Destination**: {destination}").send()
+    history.append({"role": "user", "content": message.content})
 
-    # Step 2: Booking simulation
-    await cl.Message(content="🛏️ Searching for flights and hotels...").send()
-    result2 = await Runner.run(booking_agent, input=destination, run_config=config)
-    booking_info = convert_usd_to_pkr(result2.final_output.strip())
-    await cl.Message(content=f"📦 **Booking Info**:\n{booking_info}").send()
+    # Run the triage agent
+    result = await Runner.run(triage_agent, history, run_config=config)
 
-    # Step 3: Local explore suggestions
-    await cl.Message(content="🍽️ Planning local experiences...").send()
-    result3 = await Runner.run(explore_agent, input=destination, run_config=config)
-    await cl.Message(content=f"🌆 **Explore Suggestions**:\n{result3.final_output.strip()}").send()
+    # Get and send final output
+    response_content = result.final_output
+    msg.content = response_content
+    await msg.update()
 
-    # Final message
-    await cl.Message(content="""
-✅ **Trip Plan Ready!**
-
-Type another mood or interest to explore more destinations.
-
-Happy travels! 🌍
-""").send()
+    # Save chat history
+    history.append({"role": "assistant", "content": response_content})
+    cl.user_session.set("chat_history", history)
